@@ -26,6 +26,7 @@
 
 #include <sys/stat.h>
 #include <sys/types.h>
+#include <ctype.h>
 #include <fcntl.h>
 #include <locale.h>
 #include <signal.h>
@@ -116,9 +117,7 @@ static struct plugin_watcher_t {
 #endif
 
 #ifdef HAVE_SETRLIMIT
-#ifndef LIB_ONLY
 static int nofile = 0;
-#endif
 #endif
 
 static void server_recv_cb(EV_P_ ev_io *w, int revents);
@@ -330,6 +329,7 @@ server_handshake(EV_P_ ev_io *w, buffer_t *buf)
     server_ctx_t *server_recv_ctx = (server_ctx_t *)w;
     server_t *server              = server_recv_ctx->server;
     remote_t *remote              = server->remote;
+    LOGI("-- server handshake. --");
 
     struct socks5_request *request = (struct socks5_request *)buf->data;
     size_t request_len             = sizeof(struct socks5_request);
@@ -650,50 +650,6 @@ server_stream(EV_P_ ev_io *w, buffer_t *buf)
             int s = -1;
             s = sendto(remote->fd, remote->buf->data, remote->buf->len, MSG_FASTOPEN,
                        (struct sockaddr *)&(remote->addr), remote->addr_len);
-#elif defined(TCP_FASTOPEN_WINSOCK)
-            DWORD s   = -1;
-            DWORD err = 0;
-            do {
-                int optval = 1;
-                // Set fast open option
-                if (setsockopt(remote->fd, IPPROTO_TCP, TCP_FASTOPEN,
-                               &optval, sizeof(optval)) != 0) {
-                    ERROR("setsockopt");
-                    break;
-                }
-                // Load ConnectEx function
-                LPFN_CONNECTEX ConnectEx = winsock_getconnectex();
-                if (ConnectEx == NULL) {
-                    LOGE("Cannot load ConnectEx() function");
-                    err = WSAENOPROTOOPT;
-                    break;
-                }
-                // ConnectEx requires a bound socket
-                if (winsock_dummybind(remote->fd,
-                                      (struct sockaddr *)&(remote->addr)) != 0) {
-                    ERROR("bind");
-                    break;
-                }
-                // Call ConnectEx to send data
-                memset(&remote->olap, 0, sizeof(remote->olap));
-                remote->connect_ex_done = 0;
-                if (ConnectEx(remote->fd, (const struct sockaddr *)&(remote->addr),
-                              remote->addr_len, remote->buf->data, remote->buf->len,
-                              &s, &remote->olap)) {
-                    remote->connect_ex_done = 1;
-                    break;
-                }
-                // XXX: ConnectEx pending, check later in remote_send
-                if (WSAGetLastError() == ERROR_IO_PENDING) {
-                    err = CONNECT_IN_PROGRESS;
-                    break;
-                }
-                ERROR("ConnectEx");
-            } while (0);
-            // Set error number
-            if (err) {
-                SetLastError(err);
-            }
 #else
             int s = -1;
 #if defined(CONNECT_DATA_IDEMPOTENT)
@@ -788,8 +744,10 @@ server_recv_cb(EV_P_ ev_io *w, int revents)
     ev_timer_stop(EV_A_ & server->delayed_connect_watcher);
 
     if (remote == NULL) {
+        LOGI("-- receive from local buf --");
         buf = server->buf;
     } else {
+        LOGI("-- receive from remote buf --");
         buf = remote->buf;
     }
 
@@ -857,6 +815,7 @@ server_recv_cb(EV_P_ ev_io *w, int revents)
                     break;
                 }
             char *send_buf = (char *)&response;
+            LOGI("-- init response %s %ld --", send_buf, sizeof(response));
             send(server->fd, send_buf, sizeof(response), 0);
             if (response.method == METHOD_UNACCEPTABLE) {
                 close_and_free_remote(EV_A_ remote);
@@ -885,6 +844,7 @@ server_recv_cb(EV_P_ ev_io *w, int revents)
 static void
 server_send_cb(EV_P_ ev_io *w, int revents)
 {
+    LOGI("-- server send cb --");
     server_ctx_t *server_send_ctx = (server_ctx_t *)w;
     server_t *server              = server_send_ctx->server;
     remote_t *remote              = server->remote;
@@ -950,12 +910,54 @@ remote_timeout_cb(EV_P_ ev_timer *watcher, int revents)
     close_and_free_server(EV_A_ server);
 }
 
+// typedef struct buffer {
+//     size_t idx;
+//     size_t len;
+//     size_t capacity;
+//     char   *data;
+// } buffer_t;
+#define ferr(fmt, args...) fprintf(stderr, fmt, ##args)
+
+static void
+pkgdbg(buffer_t *buf) {
+    int i = 0;
+    int len = buf->len;
+    for (i = 0; i < len; i++) {
+		if ((i % 16) == 0)
+			ferr("%08x: ", i);
+		if (isprint(buf->data[i]))
+			ferr("%c", buf->data[i]);
+		else
+			ferr(".");
+		if ((i % 16) == 15)
+			ferr("\n");
+	}
+	if ((i % 16) != 0)
+		ferr("\n");
+	ferr("packet buffer(raw):\n");
+	for (i = 0; i < len; i++) {
+		if ((i % 16) == 0)
+			ferr("%08x: ", i);
+		if ((i % 2) == 0)
+			ferr(" ");
+		ferr("%02x", buf->data[i]);
+		if ((i % 16) == 15)
+			ferr("\n");
+	}
+	if ((i % 16) != 0)
+		ferr("\n");
+
+}
+
 static void
 remote_recv_cb(EV_P_ ev_io *w, int revents)
 {
+
     remote_ctx_t *remote_recv_ctx = (remote_ctx_t *)w;
     remote_t *remote              = remote_recv_ctx->remote;
     server_t *server              = remote->server;
+    struct sockaddr_in *sockaddr = (struct sockaddr_in *)&remote->addr;
+    LOGI("-- remote recv cb from %s:%hu --", inet_ntoa(sockaddr->sin_addr), ntohs(sockaddr->sin_port));
 
     ssize_t r = recv(remote->fd, server->buf->data, SOCKET_BUF_SIZE, 0);
 
@@ -995,6 +997,7 @@ remote_recv_cb(EV_P_ ev_io *w, int revents)
         }
     }
 
+    pkgdbg(server->buf);
     int s = send(server->fd, server->buf->data, server->buf->len, 0);
 
     if (s == -1) {
@@ -1028,6 +1031,7 @@ remote_recv_cb(EV_P_ ev_io *w, int revents)
 static void
 remote_send_cb(EV_P_ ev_io *w, int revents)
 {
+    LOGI("-- remote send cb --");
     remote_ctx_t *remote_send_ctx = (remote_ctx_t *)w;
     remote_t *remote              = remote_send_ctx->remote;
     server_t *server              = remote->server;
@@ -1150,6 +1154,7 @@ new_remote(int fd, int timeout)
 static void
 free_remote(remote_t *remote)
 {
+    LOGI("free remote");
     if (remote->server != NULL) {
         remote->server->remote = NULL;
     }
@@ -1216,6 +1221,7 @@ new_server(int fd)
 static void
 free_server(server_t *server)
 {
+    LOGI("free server");
     cork_dllist_remove(&server->entries);
 
     if (server->remote != NULL) {
@@ -1379,6 +1385,7 @@ accept_cb(EV_P_ ev_io *w, int revents)
 {
     listen_ctx_t *listener = (listen_ctx_t *)w;
     int serverfd           = accept(listener->fd, NULL, NULL);
+    LOGI("-- accept callback invoked -- %d, revents: %d --", listener->fd, revents);
     if (serverfd == -1) {
         ERROR("accept");
         return;
@@ -1396,7 +1403,6 @@ accept_cb(EV_P_ ev_io *w, int revents)
     ev_io_start(EV_A_ & server->recv_ctx->io);
 }
 
-#ifndef LIB_ONLY
 int
 main(int argc, char **argv)
 {
@@ -1871,8 +1877,9 @@ main(int argc, char **argv)
         setnonblocking(listenfd);
 
         listen_ctx.fd = listenfd;
-
+        LOGI("-- ev_io_init --");
         ev_io_init(&listen_ctx.io, accept_cb, listenfd, EV_READ);
+        LOGI("-- ev_io_start --");
         ev_io_start(loop, &listen_ctx.io);
     }
 
@@ -1910,7 +1917,7 @@ main(int argc, char **argv)
 
     // Init connections
     cork_dllist_init(&connections);
-
+    LOGI("-- enter the loop --");
     // Enter the loop
     ev_run(loop, 0);
 
@@ -1946,165 +1953,3 @@ main(int argc, char **argv)
 
     return ret_val;
 }
-
-#else
-
-int
-_start_ss_local_server(profile_t profile, ss_local_callback callback, void *udata)
-{
-    srand(time(NULL));
-
-    char *remote_host = profile.remote_host;
-    char *local_addr  = profile.local_addr;
-    char *method      = profile.method;
-    char *password    = profile.password;
-    char *log         = profile.log;
-    int remote_port   = profile.remote_port;
-    int local_port    = profile.local_port;
-    int timeout       = profile.timeout;
-    int mtu           = 0;
-    int mptcp         = 0;
-
-    mode      = profile.mode;
-    fast_open = profile.fast_open;
-    verbose   = profile.verbose;
-    mtu       = profile.mtu;
-    mptcp     = profile.mptcp;
-
-    char local_port_str[16];
-    char remote_port_str[16];
-    sprintf(local_port_str, "%d", local_port);
-    sprintf(remote_port_str, "%d", remote_port);
-
-#ifdef __MINGW32__
-    winsock_init();
-#endif
-
-    USE_LOGFILE(log);
-
-    if (profile.acl != NULL) {
-        LOGI("initializing acl...");
-        acl = !init_acl(profile.acl);
-    }
-
-    if (local_addr == NULL) {
-        local_addr = "127.0.0.1";
-    }
-
-#ifndef __MINGW32__
-    // ignore SIGPIPE
-    signal(SIGPIPE, SIG_IGN);
-    signal(SIGABRT, SIG_IGN);
-#endif
-
-    ev_signal_init(&sigint_watcher, signal_cb, SIGINT);
-    ev_signal_init(&sigterm_watcher, signal_cb, SIGTERM);
-    ev_signal_start(EV_DEFAULT, &sigint_watcher);
-    ev_signal_start(EV_DEFAULT, &sigterm_watcher);
-#ifndef __MINGW32__
-    ev_signal_init(&sigusr1_watcher, signal_cb, SIGUSR1);
-    ev_signal_start(EV_DEFAULT, &sigusr1_watcher);
-#endif
-
-    // Setup keys
-    LOGI("initializing ciphers... %s", method);
-    crypto = crypto_init(password, NULL, method);
-    if (crypto == NULL)
-        FATAL("failed to init ciphers");
-
-    struct sockaddr_storage storage;
-    memset(&storage, 0, sizeof(struct sockaddr_storage));
-    if (get_sockaddr(remote_host, remote_port_str, &storage, 0, ipv6first) == -1) {
-        return -1;
-    }
-
-    // Setup proxy context
-    struct ev_loop *loop = EV_DEFAULT;
-
-    struct sockaddr *remote_addr_tmp[MAX_REMOTE_NUM];
-    listen_ctx_t listen_ctx;
-    listen_ctx.remote_num     = 1;
-    listen_ctx.remote_addr    = remote_addr_tmp;
-    listen_ctx.remote_addr[0] = (struct sockaddr *)(&storage);
-    listen_ctx.timeout        = timeout;
-    listen_ctx.iface          = NULL;
-    listen_ctx.mptcp          = mptcp;
-
-    if (ss_is_ipv6addr(local_addr))
-        LOGI("listening at [%s]:%s", local_addr, local_port_str);
-    else
-        LOGI("listening at %s:%s", local_addr, local_port_str);
-
-    if (mode != UDP_ONLY) {
-        // Setup socket
-        int listenfd;
-        listenfd = create_and_bind(local_addr, local_port_str);
-        if (listenfd == -1) {
-            ERROR("bind()");
-            return -1;
-        }
-        if (listen(listenfd, SOMAXCONN) == -1) {
-            ERROR("listen()");
-            return -1;
-        }
-        setnonblocking(listenfd);
-
-        listen_ctx.fd = listenfd;
-
-        ev_io_init(&listen_ctx.io, accept_cb, listenfd, EV_READ);
-        ev_io_start(loop, &listen_ctx.io);
-    }
-
-    // Setup UDP
-    if (mode != TCP_ONLY) {
-        LOGI("udprelay enabled");
-        struct sockaddr *addr = (struct sockaddr *)(&storage);
-        udp_fd = init_udprelay(local_addr, local_port_str, addr,
-                               get_sockaddr_len(addr), mtu, crypto, timeout, NULL);
-    }
-
-    // Init connections
-    cork_dllist_init(&connections);
-
-    if (callback) {
-        callback(listen_ctx.fd, udp_fd, udata);
-    }
-
-    // Enter the loop
-    ev_run(loop, 0);
-
-    if (verbose) {
-        LOGI("closed gracefully");
-    }
-
-    // Clean up
-    if (mode != UDP_ONLY) {
-        ev_io_stop(loop, &listen_ctx.io);
-        free_connections(loop);
-        close(listen_ctx.fd);
-    }
-
-    if (mode != TCP_ONLY) {
-        free_udprelay();
-    }
-
-#ifdef __MINGW32__
-    winsock_cleanup();
-#endif
-
-    return ret_val;
-}
-
-int
-start_ss_local_server(profile_t profile)
-{
-    return _start_ss_local_server(profile, NULL, NULL);
-}
-
-int
-start_ss_local_server_with_callback(profile_t profile, ss_local_callback callback, void *udata)
-{
-    return _start_ss_local_server(profile, callback, udata);
-}
-
-#endif

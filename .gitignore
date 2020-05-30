@@ -97,3 +97,5 @@ doc/*.html
 
 # Visual Studio Code
 .vscode/*
+libsodium-1.0.17/
+mbedtls-2.6.0/
